@@ -1,95 +1,53 @@
 #include "tinklaparams.h"
 
-
-//const std::string tinkla_params_path = "/data/params";
+namespace {
+Params &tinkla_params() {
+  static Params params;
+  return params;
+}
+}  // namespace
 
 bool tinkla_get_bool_param(const std::string &tinkla_param) {
-    ifstream ifile;
-    ifile.open(tinkla_params_path + "/" + tinkla_param);
-    if (!ifile) {
-      //no file assume false and create
-      ofstream ofile;
-      ofile.open(tinkla_params_path + "/" + tinkla_param);
-      if (ofile) {
-        ofile << 0;
-        ofile.close();
-      }
-      return false;
-    } else {
-      int value;
-      ifile >> value;
-      ifile.close();
-      if (value == 0) {
-        return false;
-      } else {
-        return true;
-      }
-    }
+  const std::string value = tinkla_params().get(tinkla_param);
+  if (value.empty()) {
+    tinkla_params().putBool(tinkla_param, false);
+    return false;
+  }
+  return value == "1";
 }
 
 void tinkla_set_bool_param(const std::string &tinkla_param,int tinkla_param_value) {
-      ofstream ofile;
-      ofile.open(tinkla_params_path + "/" + tinkla_param);
-      if (ofile) {
-        ofile << tinkla_param_value;
-        ofile.close();
-      }
+  tinkla_params().putBool(tinkla_param, tinkla_param_value != 0);
 }
 
 float tinkla_get_float_param(const std::string &tinkla_param, float default_value) {
-    ifstream ifile;
-    ifile.open(tinkla_params_path + "/" + tinkla_param);
-    if (!ifile) {
-      //no file assume default_value and create
-      ofstream ofile;
-      ofile.open(tinkla_params_path + "/" + tinkla_param);
-      if (ofile) {
-        ofile << default_value;
-        ofile.close();
-      }
-      return default_value;
-    } else {
-      float value;
-      ifile >> value;
-      ifile.close();
-      return value;
-    }
+  const std::string value = tinkla_params().get(tinkla_param);
+  if (value.empty()) {
+    tinkla_params().put(tinkla_param, std::to_string(default_value));
+    return default_value;
+  }
+
+  try {
+    return std::stof(value);
+  } catch (const std::exception &) {
+    tinkla_params().put(tinkla_param, std::to_string(default_value));
+    return default_value;
+  }
 }
 
 void tinkla_set_float_param(const std::string &tinkla_param,float tinkla_param_value) {
-      ofstream ofile;
-      ofile.open(tinkla_params_path + "/" + tinkla_param);
-      if (ofile) {
-        ofile << tinkla_param_value;
-        ofile.close();
-      }
+  tinkla_params().put(tinkla_param, std::to_string(tinkla_param_value));
 }
 
 std::string tinkla_get_str_param(const std::string &tinkla_param, std::string default_value) {
-    ifstream ifile;
-    ifile.open(tinkla_params_path + "/" + tinkla_param);
-    if (!ifile) {
-      //no file assume default_value and create
-      ofstream ofile;
-      ofile.open(tinkla_params_path + "/" + tinkla_param);
-      if (ofile) {
-        ofile << default_value;
-        ofile.close();
-      }
-      return default_value;
-    } else {
-      std::stringstream strStream;
-      strStream << ifile.rdbuf();
-      std::string str = strStream.str();
-      return str;
-    }
+  const std::string value = tinkla_params().get(tinkla_param);
+  if (value.empty()) {
+    tinkla_params().put(tinkla_param, default_value);
+    return default_value;
+  }
+  return value;
 }
 
 void tinkla_set_str_param(const std::string &tinkla_param,std::string tinkla_param_value) {
-      ofstream ofile;
-      ofile.open(tinkla_params_path + "/" + tinkla_param);
-      if (ofile) {
-        ofile << tinkla_param_value;
-        ofile.close();
-      }
+  tinkla_params().put(tinkla_param, tinkla_param_value);
 }

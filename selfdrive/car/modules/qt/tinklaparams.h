@@ -3,6 +3,7 @@
 using std::cerr;
 using std::cout;
 using std::endl;
+#include <string>
 #include <fstream>
 using std::ifstream;
 using std::ofstream;
