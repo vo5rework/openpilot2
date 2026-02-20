@@ -261,20 +261,9 @@ class CarController(CarControllerBase):
           self._stw_sequence.pop(0)
 
   def _auto_engage_bus(self, CS) -> int:
-    primary = int(self._stw_bus(CS))
-    if self.CP.carFingerprint in LEGACY_CARS:
-      candidates = [primary]
-      for b in (int(CANBUS.party), int(CANBUS.powertrain)):
-        if b not in candidates:
-          candidates.append(b)
-    else:
-      candidates = [primary]
-      for b in (int(CANBUS.party), int(CANBUS.autopilot_party)):
-        if b not in candidates:
-          candidates.append(b)
-
-    idx = int(self._auto_engage_attempt) % max(1, len(candidates))
-    return int(candidates[idx])
+    # Use the observed STW source bus only. Rotating buses caused retries to land on
+    # non-effective paths in xnor traces, which looked like "queued" engages with no state change.
+    return int(self._stw_bus(CS))
 
   @staticmethod
   def _auto_engage_speed_ms(CS) -> float:
@@ -334,9 +323,9 @@ class CarController(CarControllerBase):
     # In xnor, SET-only while standby has been unreliable; use MAIN then SET pulse.
     self._stw_sequence = [
       (int(self.frame), BTN_MAIN, tx_bus),
-      (int(self.frame) + int(delay), BTN_DOWN1, tx_bus),
+      (int(self.frame) + int(delay), BTN_UP1, tx_bus),
     ]
-    stage = "MAIN+SET"
+    stage = "MAIN+RESUME"
 
     self._auto_engage_last_frame = int(self.frame)
     self._auto_engage_attempt += 1
