@@ -203,7 +203,16 @@ class CarState(CarStateBase):
 
 
   def _update_speed_limit(self, can_parsers) -> None:
-    """Unity-parity speed limit parsing (map/sign + DAS fallback) into m/s."""
+    """Unity-parity speed limit parsing (map/sign + DAS fallback) into m/s.
+
+    Tesla legacy DBCs have multiple naming variants across releases. Support both:
+
+      - UI_mppSpeedLimit / UI_mapSpeedLimitUnits
+      - mppSpeedLimit / units
+      - mapSpeedLimitUnits
+
+    Message name remains UI_gpsVehicleSpeed.
+    """
     speed_limit_ms = 0.0
     speed_limit_ms_das = 0.0
 
@@ -218,26 +227,40 @@ class CarState(CarStateBase):
           continue
       return None
 
+    def _get(d: dict, *keys, default=0.0):
+      for k in keys:
+        if k in d:
+          return d.get(k)
+      return default
+
     try:
       gps = _msg("UI_gpsVehicleSpeed")
-      if gps is not None:
-        msu = int(gps.get("UI_mapSpeedLimitUnits", 0))
+      if isinstance(gps, dict):
+        msu = int(_get(gps, "UI_mapSpeedLimitUnits", "mapSpeedLimitUnits", "units", default=0) or 0)
         map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
         map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
 
         map_data = _msg("UI_driverAssistMapData") or {}
-        speed_limit_type = int(map_data.get("UI_mapSpeedLimitType", map_data.get("UI_mapSpeedLimitType", map_data.get("UI_mapSpeedLimit", 0))) or 0)
+        if not isinstance(map_data, dict):
+          map_data = {}
+        speed_limit_type = int(_get(map_data, "UI_mapSpeedLimitType", "mapSpeedLimitType", default=0) or 0)
 
         rd = _msg("UI_driverAssistRoadSign") or {}
+        if not isinstance(rd, dict):
+          rd = {}
+        road_sign = int(_get(rd, "UI_roadSign", "roadSign", default=0) or 0)
+
         base_map = 0.0
-        if int(rd.get("UI_roadSign", 0)) == 3:
-          base_map = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0) or 0.0)
+        if road_sign == 3:
+          base_map = float(_get(rd, "UI_baseMapSpeedLimitMPS", "baseMapSpeedLimitMPS", default=0.0) or 0.0)
+          # Round up to the nearest unit (Unity parity)
           base_map = int(base_map * map_ms_to_uom + 0.99) / map_ms_to_uom
 
         if base_map > 0.0 and (speed_limit_type != 0x1F or base_map >= 5.56):
           speed_limit_ms = base_map
         else:
-          speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0) * map_uom_to_ms
+          mpp = float(_get(gps, "UI_mppSpeedLimit", "mppSpeedLimit", default=0.0) or 0.0)
+          speed_limit_ms = mpp * map_uom_to_ms
     except Exception:
       pass
 
@@ -319,11 +342,16 @@ class CarState(CarStateBase):
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
-    cruise_state = self.can_define.dv["DI_state"]["DI_cruiseState"].get(int(cp_party.vl["DI_state"]["DI_cruiseState"]), None)
+    raw_cruise_state = int(cp_party.vl["DI_state"]["DI_cruiseState"])
+    cruise_state = self.can_define.dv["DI_state"]["DI_cruiseState"].get(raw_cruise_state, None)
     speed_units = self.can_define.dv["DI_state"]["DI_speedUnits"].get(int(cp_party.vl["DI_state"]["DI_speedUnits"]), None)
 
     autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
+
+    # Legacy Model S HW2: DI_cruiseState often has no enum table (e.g. raw=15). Unity treats any non-zero as enabled.
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
+    if (cruise_state is None) and (raw_cruise_state != 0):
+      cruise_enabled = True
     self.update_autopark_state(autopark_state, cruise_enabled)
     # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
@@ -349,6 +377,9 @@ class CarState(CarStateBase):
 
     # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
+
+    # Speed limit best-effort (needed for speed-limit matching)
+    self._update_speed_limit(can_parsers)
 
     stw = None
     stw_bus = None
@@ -533,10 +564,14 @@ class CarState(CarStateBase):
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
-    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"]["DI_cruiseState"]), None)
+    raw_cruise_state = int(cp_chassis.vl["DI_state"]["DI_cruiseState"])
+    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(raw_cruise_state, None)
     speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
 
+    # Legacy Model S HW2: DI_cruiseState often has no enum table (e.g. raw=15). Unity treats any non-zero as enabled.
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
+    if (cruise_state is None) and (raw_cruise_state != 0):
+      cruise_enabled = True
     # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
     ret.cruiseState.enabled = cruise_enabled
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
@@ -684,3 +719,29 @@ class CarState(CarStateBase):
       Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4),
     }
+
+# --- XNOR guard: ensure CarState is not left abstract by accidental indentation edits ---
+import abc as _abc  # noqa: E402
+
+def _xnor__ensure_carstate_update() -> None:
+  cls = CarState
+  abstract = set(getattr(cls, "__abstractmethods__", set()) or set())
+  if ("update" in abstract) or (not hasattr(cls, "update")):
+    def update(self, can_parsers):  # type: ignore[override]
+      # Model S HW2/AP2 legacy only: delegate to legacy update
+      if hasattr(self, "CP") and getattr(self.CP, "carFingerprint", None) in LEGACY_CARS and hasattr(self, "update_legacy"):
+        return self.update_legacy(can_parsers)
+      # Non-legacy fallback (shouldn't be used for this target)
+      if hasattr(self, "_update_non_legacy"):
+        return self._update_non_legacy(can_parsers)  # pylint: disable=no-member
+      if hasattr(self, "update_non_legacy"):
+        return self.update_non_legacy(can_parsers)
+      raise NotImplementedError("CarState.update missing; fix indentation in carstate.py")
+
+    cls.update = update  # type: ignore[assignment]
+  _abc.update_abstractmethods(cls)
+  if "update" in getattr(cls, "__abstractmethods__", set()):
+    raise TypeError("CarState still abstract: missing update() implementation")
+
+_xnor__ensure_carstate_update()
+# --- end XNOR guard ---
