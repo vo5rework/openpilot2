@@ -115,6 +115,28 @@ class CarController(CarControllerBase):
     except Exception:
       self._cached_speed_limit_offset_uom = 0.0
 
+  def _fake_das_buses(self) -> tuple[int, ...]:
+    buses = [int(CANBUS.party)]
+    try:
+      pt = int(CANBUS.powertrain)
+      if pt not in buses:
+        buses.append(pt)
+    except Exception:
+      pass
+    return tuple(buses)
+
+  def _emit_fake_das_edges(self, can_sends, *, stalk_main: bool = False, stalk_cancel: bool = False) -> None:
+    if not stalk_main and not stalk_cancel:
+      return
+    for bus in self._fake_das_buses():
+      can_sends.append(create_fake_das(
+        self._cached_pedal_enabled,
+        self._cached_autopilot_disabled,
+        bus=bus,
+        stalk_main=bool(stalk_main),
+        stalk_cancel=bool(stalk_cancel),
+      ))
+
   def _emit_internal_0x659(self, CS, can_sends) -> None:
     stalk_btn = int(getattr(CS, "cruise_buttons", 0) or 0)
     prev_btn = int(self._op659_prev_btn)
@@ -125,7 +147,7 @@ class CarController(CarControllerBase):
     self._op659_prev_btn = stalk_btn
 
     if (self.frame % 10 == 0) or main_edge or cancel_edge:
-      for bus in (CANBUS.party,):
+      for bus in self._fake_das_buses():
         can_sends.append(create_fake_das(
           self._cached_pedal_enabled,
           self._cached_autopilot_disabled,
@@ -181,6 +203,11 @@ class CarController(CarControllerBase):
     used_counter = (mc + 1) % 16
 
     can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), self._stw_seed, int(btn)))
+
+    if int(btn) == int(BTN_MAIN):
+      self._emit_fake_das_edges(can_sends, stalk_main=True)
+    elif int(btn) == int(BTN_CANCEL):
+      self._emit_fake_das_edges(can_sends, stalk_cancel=True)
 
     self._stw_seed["MC_STW_ACTN_RQ"] = int(used_counter)
     self._stw_last_send_frame = int(self.frame)
