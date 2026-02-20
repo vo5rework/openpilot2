@@ -12,6 +12,7 @@ from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, C
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
 
 
 def get_safety_CP():
@@ -47,6 +48,8 @@ class CarController(CarControllerBase):
     self._action_packer = CANPacker("tesla_can")
     self._action_can = TeslaCAN(self._action_packer)
     self._sm = None
+    self._stw_release_frame = -1
+    self._auto_engage_last_frame = -100000
 
     # Vehicle model used for lateral limiting
     self.VM = VehicleModel(get_safety_CP())
@@ -106,6 +109,44 @@ class CarController(CarControllerBase):
       return int(round(speed_ms * CV.MS_TO_KPH))
     return int(round(speed_ms * CV.MS_TO_MPH))
 
+
+  def _queue_stalk_pulse(self, CS, can_sends, btn: int) -> bool:
+    if int(self._stw_release_frame) >= int(self.frame):
+      return False
+    if getattr(CS, "msg_stw_actn_req", None) is None:
+      return False
+
+    bus = int(CANBUS.party)
+    can_sends.insert(0, self._action_can.create_action_request(bus, CS.msg_stw_actn_req, int(btn)))
+    self._stw_release_frame = int(self.frame) + 1
+    return True
+
+  def _auto_engage_stock_cruise(self, CC, CS, can_sends) -> None:
+    op_lateral_active = bool(getattr(CC, 'enabled', False) or getattr(CC, 'latActive', False) or getattr(CS, 'cruiseEnabled', False))
+    if not op_lateral_active or (not self._cached_autopilot_disabled):
+      return
+    if bool(getattr(CS, 'stock_cruise_enabled', False)):
+      return
+
+    ego_for_engage_ms = max(
+      float(getattr(getattr(CS, 'out', None), 'vEgo', 0.0) or 0.0),
+      float(getattr(getattr(CS, 'out', None), 'vEgoRaw', 0.0) or 0.0),
+      float(getattr(getattr(CS, 'out', None), 'vEgoCluster', 0.0) or 0.0),
+    )
+    if ego_for_engage_ms < (18.0 * CV.MPH_TO_MS):
+      return
+
+    if (self.frame - int(self._auto_engage_last_frame)) < 100:
+      return
+
+    stock_available = bool(getattr(CS, 'stock_cruise_available', False))
+    # Unity-aligned adaptation for xnor: once DI reports STANDBY, send RESUME to latch ENABLED.
+    btn = CruiseButtons.RES_ACCEL if stock_available else CruiseButtons.MAIN
+    if self._queue_stalk_pulse(CS, can_sends, int(btn)):
+      self._auto_engage_last_frame = int(self.frame)
+      stage = 'RESUME' if stock_available else 'MAIN'
+      cloudlog.info(f"[XNOR_CRUISE_ENGAGE] queued {stage} ego={ego_for_engage_ms*CV.MS_TO_MPH:.1f}mph standby={stock_available}")
+
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
     can_sends = []
@@ -120,6 +161,13 @@ class CarController(CarControllerBase):
     # Send fake DAS msg at 10Hz (consumed by panda safety, blocked from hitting the car)
     if (self.frame % 10) == 0:
       can_sends.append(self._action_can.create_fake_das_msg(self._cached_pedal_enabled, self._cached_autopilot_disabled, CANBUS.party))
+
+    if int(self._stw_release_frame) == int(self.frame):
+      if getattr(CS, "msg_stw_actn_req", None) is not None:
+        can_sends.insert(0, self._action_can.create_action_request(int(CANBUS.party), CS.msg_stw_actn_req, int(CruiseButtons.IDLE)))
+      self._stw_release_frame = -1
+
+    self._auto_engage_stock_cruise(CC, CS, can_sends)
 
     # Tesla EPS enforces disabling steering on heavy lateral override force.
     # When enabling in a tight curve, we wait until user reduces steering force to start steering.
