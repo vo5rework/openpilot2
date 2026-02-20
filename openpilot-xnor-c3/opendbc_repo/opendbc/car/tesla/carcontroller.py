@@ -180,6 +180,21 @@ class CarController(CarControllerBase):
     except Exception:
       return int(CANBUS.party)
 
+  def _stw_target_buses(self, primary_bus: int) -> tuple[int, ...]:
+    buses = [int(primary_bus)]
+
+    # xnor/AP split buses: mirror virtual stalk commands so MAIN/SET reaches stock cruise path.
+    if self.CP.carFingerprint in LEGACY_CARS:
+      for b in (int(CANBUS.party), int(CANBUS.powertrain)):
+        if b not in buses:
+          buses.append(b)
+    else:
+      for b in (int(CANBUS.party), int(CANBUS.autopilot_party)):
+        if b not in buses:
+          buses.append(b)
+
+    return tuple(buses)
+
   def _action_can_for_bus(self, bus: int):
     return (
       self._action_can_by_bus.get(int(bus)) or
@@ -202,7 +217,8 @@ class CarController(CarControllerBase):
     mc = int(self._stw_seed.get("MC_STW_ACTN_RQ", 0) or 0)
     used_counter = (mc + 1) % 16
 
-    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), self._stw_seed, int(btn)))
+    for tx_bus in self._stw_target_buses(b):
+      can_sends.append(self._action_can_for_bus(tx_bus).create_action_request(int(tx_bus), self._stw_seed, int(btn)))
 
     if int(btn) == int(BTN_MAIN):
       self._emit_fake_das_edges(can_sends, stalk_main=True)
