@@ -75,6 +75,7 @@ class CarState(CarStateBase):
     self.speed_limit_ms = 0.0
     self.speed_limit_ms_das = 0.0
     self.stock_cruise_enabled = False
+    self.stock_cruise_available = False
     self.stock_cruise_set_speed_ms = 0.0
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
@@ -347,6 +348,7 @@ class CarState(CarStateBase):
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
     cruise_set_u, src = self._pick_stock_cruise_set_u(cp_party.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
+    self.stock_cruise_available = bool(cruise_state == "STANDBY" or cruise_enabled)
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
@@ -560,6 +562,7 @@ class CarState(CarStateBase):
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
     cruise_set_u, src = self._pick_stock_cruise_set_u(cp_chassis.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
+    self.stock_cruise_available = bool(cruise_state == "STANDBY" or cruise_enabled)
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)

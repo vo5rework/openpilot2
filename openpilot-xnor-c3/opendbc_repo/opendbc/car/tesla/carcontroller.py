@@ -306,13 +306,24 @@ class CarController(CarControllerBase):
       delay = 6
 
     tx_bus = int(self._auto_engage_bus(CS))
-    self._stw_sequence = [
-      (int(self.frame), BTN_MAIN, tx_bus),
-      (int(self.frame) + int(delay), BTN_DOWN1, tx_bus),
-    ]
+    stock_available = bool(getattr(CS, "stock_cruise_available", False))
+
+    if stock_available:
+      # Already in standby: send SET to engage.
+      self._stw_sequence = [
+        (int(self.frame), BTN_DOWN1, tx_bus),
+      ]
+      stage = "SET"
+    else:
+      # Not in standby yet: send MAIN only, wait for DI_state to report standby, then SET on next retry.
+      self._stw_sequence = [
+        (int(self.frame), BTN_MAIN, tx_bus),
+      ]
+      stage = "MAIN"
+
     self._auto_engage_last_frame = int(self.frame)
     self._auto_engage_attempt += 1
-    cloudlog.info(f"[XNOR_CRUISE_SYNC] auto-engage queued MAIN+SET delay={delay} bus={tx_bus}")
+    cloudlog.info(f"[XNOR_CRUISE_SYNC] auto-engage queued {stage} delay={delay} bus={tx_bus} standby={stock_available}")
 
   def _speed_limit_sync(self, CC, CS, can_sends) -> None:
     # Only when OP is engaged (steering control) and user enabled this feature.
