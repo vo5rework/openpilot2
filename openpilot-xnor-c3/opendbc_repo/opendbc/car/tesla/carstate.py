@@ -177,6 +177,13 @@ class CarState(CarStateBase):
       elif abs(a - v_u) <= thr:
         self._cruise_set_scale = 1.0
 
+    # Keep learning while in STANDBY/ENABLED to catch forks where DI_cruiseSet stays half-scale.
+    if bool(cruise_enabled) and a > 0.0:
+      if (b > 0.0) and (abs((2.0 * a) - b) <= thr) and (abs(a - b) > thr):
+        self._cruise_set_scale = 2.0
+      elif (abs((2.0 * a) - v_u) <= thr) and (abs(a - v_u) > thr):
+        self._cruise_set_scale = 2.0
+
     scale = float(getattr(self, "_cruise_set_scale", 1.0) or 1.0)
     self._stock_cruise_enabled_prev = bool(cruise_enabled)
 

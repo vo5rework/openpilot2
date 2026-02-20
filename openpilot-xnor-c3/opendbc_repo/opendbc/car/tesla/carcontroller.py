@@ -318,10 +318,12 @@ class CarController(CarControllerBase):
       return
 
     tx_bus = int(self._auto_engage_bus(CS))
+    # In xnor, SET-only while standby has been unreliable; use MAIN then SET pulse.
     self._stw_sequence = [
-      (int(self.frame), BTN_DOWN1, tx_bus),
+      (int(self.frame), BTN_MAIN, tx_bus),
+      (int(self.frame) + int(delay), BTN_DOWN1, tx_bus),
     ]
-    stage = "SET"
+    stage = "MAIN+SET"
 
     self._auto_engage_last_frame = int(self.frame)
     self._auto_engage_attempt += 1
