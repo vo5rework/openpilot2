@@ -1,0 +1,178 @@
+#include "opendbc/safety/safety_declarations.h"
+#include "opendbc/safety/safety_helpers.h"
+
+#ifndef GET_BYTE
+#define GET_BYTE(msg, i) ((uint8_t)GET_BYTES((msg), (i), 1U))
+#endif
+
+
+// CAN messages we care about
+#define STW_ACTN_RQ 0x45U     // stalk request (main/cancel)
+#define DAS_control 0x2B9U    // steering command
+#define DAS_steering 0x488U   // steering status
+#define DAS_steeringControl 0x2B9U
+#define DAS_status 0x659U     // internal "carrier" for safety state
+
+// state
+static bool tesla_legacy_use_stalk_controls_allowed = false;
+static bool tesla_legacy_op_stalk_enable = false;  // Unity parity: allow stalk-enable without relying on 0x659 arriving on every panda
+static bool tesla_legacy_op_autopilot_disabled = false;
+static bool tesla_legacy_op_pedal_enabled = false;
+
+static int tesla_hw3 = 0;
+static int tesla_ap_das_hw = 0;
+static int tesla_ap_das = 0;
+static int tesla_carpedal = 0;
+static int tesla_das_hw = 0;
+static int tesla_powertrain = 0;
+static int tesla_carberry = 0;
+
+static int chassis_bus = 0;
+
+static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
+  // *** receive hook ***
+
+  const bool valid = true;  // validity handled by generic_rx_checks()
+  if (!valid) {
+    return;
+  }
+
+  // update steering angle sample
+  if (msg->addr == DAS_steering) {
+    const int16_t angle_meas = (int16_t)GET_BYTES(msg, 0U, 2U);
+    update_sample(&angle_meas, angle_meas);
+  }
+
+  // check stalk for enabling controlsAllowed
+  // Note: in Unity, this is gated by "AP disabled". In XNOR dual-panda setups, 0x659 may not be observed
+  // on every panda, so we OR-in the OP stalk enable flag to keep both pandas in sync.
+  if ((msg->addr == STW_ACTN_RQ) && (tesla_legacy_op_autopilot_disabled || tesla_legacy_op_stalk_enable)) {
+    // lever position is bits 0..5 of byte 0
+    const uint8_t lever_position = (uint8_t)(GET_BYTES(msg, 0U, 1U) & 0x3FU);
+
+    // lever=2 is "main" pull (your logs show lever=2)
+    const bool stalk_main = (lever_position == 2U);
+    const bool stalk_cancel = (lever_position == 0U);
+
+    if (stalk_main) {
+      tesla_legacy_use_stalk_controls_allowed = true;
+      pcm_cruise_check(true);
+    }
+    if (stalk_cancel) {
+      tesla_legacy_use_stalk_controls_allowed = false;
+      pcm_cruise_check(false);
+    }
+  }
+
+  // stock cruise logic
+  generic_rx_checks(msg);
+}
+
+static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
+  // *** transmit hook ***
+
+  bool tx = true;
+
+  const int addr = msg->addr;
+
+  // Block our internal carrier from ever going to the car,
+  // but still parse it to update safety state.
+  if (addr == (int)DAS_status) {
+    // byte5 is where your carrier packs bits (Unity parity)
+    const uint8_t b5 = (uint8_t)GET_BYTES(msg, 5U, 1U);
+
+    // Unity parity: b5 bit7 => "AP disabled", bit5 => "pedal enabled"
+    tesla_legacy_op_autopilot_disabled = ((b5 & 0x80U) != 0U);
+    tesla_legacy_op_pedal_enabled = ((b5 & 0x20U) != 0U);
+
+    tx = false;
+  }
+
+  // Steering command checks
+  if (addr == (int)DAS_control) {
+    // angle request is bytes 0..1 signed
+    const int16_t desired_angle = (int16_t)GET_BYTES(msg, 0U, 2U);
+
+    // apply max angle rate limits
+    if (tesla_hw3) {
+      if (steer_angle_cmd_checks(desired_angle, TESLA_HW3_MAX_STEER, TESLA_HW3_MAX_RT_DELTA, TESLA_HW3_MAX_RATE_UP, TESLA_HW3_MAX_RATE_DOWN)) {
+        tx = false;
+      }
+    } else {
+      if (steer_angle_cmd_checks(desired_angle, TESLA_HW2_MAX_STEER, TESLA_HW2_MAX_RT_DELTA, TESLA_HW2_MAX_RATE_UP, TESLA_HW2_MAX_RATE_DOWN)) {
+        tx = false;
+      }
+    }
+  }
+
+  // standard checks (brake/gas/etc)
+  if (tx) {
+    tx = generic_tx_checks(msg);
+  }
+
+  return tx;
+}
+
+static int tesla_legacy_fwd_hook(int bus_num, int addr) {
+  // *** forwarding hook ***
+  // XNOR legacy typically doesn't rely on forwarding here; keep conservative defaults.
+  int bus_fwd = -1;
+
+  // Forward between main and chassis when powertrain gateway is present
+  // (matches typical Tesla legacy routing expectations).
+  if (tesla_powertrain) {
+    if (bus_num == 0) {
+      bus_fwd = 2;
+    } else if (bus_num == 2) {
+      bus_fwd = 0;
+    }
+  }
+
+  return bus_fwd;
+}
+
+static safety_config tesla_legacy_init(uint16_t param) {
+  // *** init hook ***
+
+  const int TESLA_FLAG_CARBERRY = 1;
+  const int TESLA_FLAG_DAS_HW = 2;
+  const int TESLA_FLAG_POWERTRAIN = 4;
+  const int TESLA_FLAG_AP_DAS = 8;
+  const int TESLA_FLAG_HW3 = 16;
+  const int TESLA_FLAG_OP_STALK_ENABLE = 32;
+
+  tesla_carberry = GET_FLAG(param, TESLA_FLAG_CARBERRY);
+  tesla_das_hw = GET_FLAG(param, TESLA_FLAG_DAS_HW);
+  tesla_powertrain = GET_FLAG(param, TESLA_FLAG_POWERTRAIN);
+  tesla_ap_das = GET_FLAG(param, TESLA_FLAG_AP_DAS);
+  tesla_hw3 = GET_FLAG(param, TESLA_FLAG_HW3);
+
+  // Unity parity: if OP stalk-enable is requested, default the "autopilot disabled" gate to true
+  // so stalk transitions can unlock controls even if 0x659 isn't observed on every panda.
+  tesla_legacy_op_stalk_enable = GET_FLAG(param, TESLA_FLAG_OP_STALK_ENABLE);
+  if (tesla_legacy_op_stalk_enable) {
+    tesla_legacy_op_autopilot_disabled = true;
+  }
+
+  tesla_ap_das_hw = (tesla_ap_das && tesla_das_hw);
+  tesla_carpedal = tesla_carberry && tesla_powertrain;
+
+  chassis_bus = tesla_powertrain ? 2 : 0;
+
+  // reset local state
+  tesla_legacy_use_stalk_controls_allowed = false;
+
+  // build safety config
+  safety_config ret;
+  ret.rx_checks = tesla_legacy_rx_checks;
+  ret.rx_checks_len = tesla_legacy_rx_checks_len;
+  ret.tx_msgs = tesla_legacy_tx_msgs;
+  ret.tx_msgs_len = tesla_legacy_tx_msgs_len;
+  ret.fwd = tesla_legacy_fwd_hook;
+  ret.init = tesla_legacy_init;
+  ret.rx = tesla_legacy_rx_hook;
+  ret.tx = tesla_legacy_tx_hook;
+
+  return ret;
+}
+

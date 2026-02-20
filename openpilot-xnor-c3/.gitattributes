@@ -1,0 +1,2 @@
+# Default: treat text files as text and store as LF in the repo
+* text=auto eol=lf

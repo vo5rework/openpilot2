@@ -1,0 +1,193 @@
+import numpy as np
+from opendbc.can import CANPacker
+from opendbc.car import Bus
+from opendbc.car.lateral import apply_std_steer_angle_limits
+from opendbc.car.interfaces import CarControllerBase
+from opendbc.car.tesla.teslacan import TeslaCAN
+from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven
+from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR, CruiseButtons
+from opendbc.car.common.conversions import Conversions as CV
+from opendbc.car.vehicle_model import VehicleModel
+from openpilot.common.params import Params
+
+
+def get_safety_CP():
+  # We use the TESLA_MODEL_Y platform for lateral limiting to match safety
+  # A Model 3 at 40 m/s using the Model Y limits sees a <0.3% difference in max angle (from curvature factor)
+  from opendbc.car.tesla.interface import CarInterface
+  return CarInterface.get_non_essential_params("TESLA_MODEL_Y")
+
+
+
+def _safe_get_bool(params, key: str, default: bool = False) -> bool:
+  try:
+    return bool(params.get_bool(key))
+  except Exception:
+    return default
+
+class CarController(CarControllerBase):
+  def __init__(self, dbc_names, CP):
+    super().__init__(dbc_names, CP)
+    # Unity parity: publish internal panda-config message (0x659) so safety can latch controlsAllowed
+    self._params = Params()
+    self._cached_autopilot_disabled = False
+    self._cached_pedal_enabled = False
+    self._params_last_read_frame = -100000
+    self.hands_on_level_limit = 3
+    self.apply_angle_last = 0
+    self.packer = CANPacker(dbc_names[Bus.party])
+    self.tesla_can = TeslaCAN(self.packer)
+    # Legacy cruise stalk emulation uses tesla_can.dbc (not present in model3_party dbc)
+    self._action_packer = CANPacker("tesla_can")
+    self._action_can = TeslaCAN(self._action_packer)
+    self._sm = None
+
+    # Vehicle model used for lateral limiting
+    self.VM = VehicleModel(get_safety_CP())
+
+    if CP.carFingerprint in LEGACY_CARS:
+      if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1,):
+        CANBUS.powertrain = CANBUS.party
+        CANBUS.autopilot_powertrain = CANBUS.autopilot_party
+
+      self.packers = {CANBUS.party: CANPacker(dbc_names[Bus.party]), CANBUS.powertrain: CANPacker(dbc_names[Bus.pt])}
+      self.tesla_can = TeslaCANRaven(self.packers)
+      from opendbc.car.tesla.interface import CarInterface
+      self.VM = VehicleModel(CarInterface.get_non_essential_params("TESLA_MODEL_S_HW3"))
+
+
+  def _ensure_sm(self):
+    if self._sm is None:
+      from cereal import messaging
+      self._sm = messaging.SubMaster(["longitudinalPlan"])
+
+  def _compute_desired_set_speed_ms(self, CC, CS, long_active: bool) -> float:
+    """Target cruise speed for speed limit matching + lead-based lowering (Unity parity)."""
+    if not getattr(CS, "_tinkla", None):
+      return 0.0
+    if not CS._tinkla.adjust_acc_with_speed_limit:
+      return 0.0
+    if not long_active:
+      return 0.0
+    if not CS.out.cruiseState.enabled:
+      return 0.0
+
+    # Speed limit target from carstate (ms)
+    try:
+      desired_ms = float(CS._calc_speed_limit_target_ms(CS.speed_units))
+    except Exception:
+      desired_ms = 0.0
+
+    # Lead-based lowering using longitudinalPlan (already includes model/radar)
+    self._ensure_sm()
+    if self.frame % 20 == 0:
+      self._sm.update(0)
+
+    try:
+      lp = self._sm["longitudinalPlan"]
+      if getattr(lp, "hasLead", False):
+        plan_ms = float(lp.speeds[-1]) if len(lp.speeds) else 0.0
+        if plan_ms > 0.0:
+          desired_ms = plan_ms if desired_ms <= 0.0 else min(desired_ms, plan_ms)
+    except Exception:
+      pass
+
+    return float(max(desired_ms, 0.0))
+
+  @staticmethod
+  def _ms_to_uom_int(speed_ms: float, speed_units: str) -> int:
+    if speed_units == "KPH":
+      return int(round(speed_ms * CV.MS_TO_KPH))
+    return int(round(speed_ms * CV.MS_TO_MPH))
+
+  def update(self, CC, CS, now_nanos):
+    actuators = CC.actuators
+    can_sends = []
+
+    # Refresh params occasionally (avoid hammering paramfs)
+    if (self.frame - self._params_last_read_frame) >= 50:
+      self._params_last_read_frame = self.frame
+      # Keys vary across forks; try the common ones
+      self._cached_autopilot_disabled = bool(_safe_get_bool(self._params, "TinklaAutopilotDisabled"))
+      self._cached_pedal_enabled = bool(_safe_get_bool(self._params, "TinklaPedalEnabled") or _safe_get_bool(self._params, "PedalEnabled"))
+
+    # Send fake DAS msg at 10Hz (consumed by panda safety, blocked from hitting the car)
+    if (self.frame % 10) == 0:
+      can_sends.append(self._action_can.create_fake_das_msg(self._cached_pedal_enabled, self._cached_autopilot_disabled, CANBUS.party))
+
+    # Tesla EPS enforces disabling steering on heavy lateral override force.
+    # When enabling in a tight curve, we wait until user reduces steering force to start steering.
+    # Canceling is done on rising edge and is handled generically with CC.cruiseControl.cancel
+    autopilot_disabled = bool(getattr(CS, 'autopilot_disabled', False))
+    lat_active = CC.latActive and (not bool(getattr(CS, 'human_control', False))) and (not CS.out.cruiseState.standstill)
+    if self.frame % 2 == 0:
+      # Angular rate limit based on speed
+      self.apply_angle_last = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
+                                                          lat_active, CarControllerParams, self.VM)
+      if lat_active:
+        # Unity C3 parity: prevent EPS faults from large instantaneous angle steps
+        self.apply_angle_last = float(np.clip(self.apply_angle_last, CS.out.steeringAngleDeg - 20.0, CS.out.steeringAngleDeg + 20.0))
+      if self.CP.carFingerprint in LEGACY_CARS:
+        cntr = (self.frame // 2) % 16
+        can_sends.append(self.tesla_can.create_steering_control(cntr, self.apply_angle_last, lat_active))
+      else:
+        can_sends.append(self.tesla_can.create_steering_control(self.apply_angle_last, lat_active))
+
+    if self.frame % 10 == 0 and self.CP.carFingerprint not in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1, ):
+      cntr = (self.frame // 10) % 16
+      can_sends.append(self.tesla_can.create_steering_allowed(cntr))
+
+    # Longitudinal control
+    if self.CP.openpilotLongitudinalControl:
+      if self.frame % 4 == 0:
+        state = 13 if CC.cruiseControl.cancel else 4  # 4=ACC_ON, 13=ACC_CANCEL_GENERIC_SILENT
+        accel = float(np.clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
+        cntr = (self.frame // 4) % 8
+
+        long_active = bool(CC.longActive) and not autopilot_disabled
+
+        desired_ms = self._compute_desired_set_speed_ms(CC, CS, long_active)
+        set_speed_kph = None
+        if desired_ms > 0.0 and self.CP.carFingerprint not in LEGACY_CARS:
+          # Modern Tesla uses DAS_setSpeed directly (no STW_ACTN_RQ in model3_party dbc)
+          set_speed_kph = desired_ms * CV.MS_TO_KPH
+
+        if self.CP.carFingerprint in LEGACY_CARS:
+          can_sends.append(self.tesla_can.create_longitudinal_command(state, accel, cntr, CS.out.vEgo, long_active))
+        else:
+          can_sends.append(self.tesla_can.create_longitudinal_command(state, accel, cntr, CS.out.vEgo, long_active, set_speed_kph=set_speed_kph))
+
+        # Legacy Tesla: emulate cruise stalk presses to match set speed (Unity parity)
+        if desired_ms > 0.0 and self.CP.carFingerprint in LEGACY_CARS and (self.frame % 20 == 0):
+          cur_ms = float(CS.out.cruiseState.speed)
+          desired_u = self._ms_to_uom_int(desired_ms, getattr(CS, "speed_units", "MPH"))
+          cur_u = self._ms_to_uom_int(cur_ms, getattr(CS, "speed_units", "MPH"))
+          diff = desired_u - cur_u
+
+          btn = CruiseButtons.IDLE
+          if diff >= 5:
+            btn = CruiseButtons.RES_ACCEL_2ND
+          elif diff >= 1:
+            btn = CruiseButtons.RES_ACCEL
+          elif diff <= -5:
+            btn = CruiseButtons.DECEL_2ND
+          elif diff <= -1:
+            btn = CruiseButtons.DECEL_SET
+
+          if btn != CruiseButtons.IDLE and getattr(CS, "msg_stw_actn_req", None) is not None:
+            # On legacy platforms STW_ACTN_RQ is on the chassis bus
+            bus = CANBUS.party
+            can_sends.insert(0, self._action_can.create_action_request(bus, CS.msg_stw_actn_req, btn))
+
+    else:
+      # Increment counter so cancel is prioritized even without openpilot longitudinal
+      if CC.cruiseControl.cancel:
+        cntr = (CS.das_control["DAS_controlCounter"] + 1) % 8
+        can_sends.append(self.tesla_can.create_longitudinal_command(13, 0, cntr, CS.out.vEgo, False))
+
+    # TODO: HUD control
+    new_actuators = actuators.as_builder()
+    new_actuators.steeringAngleDeg = self.apply_angle_last
+
+    self.frame += 1
+    return new_actuators, can_sends
