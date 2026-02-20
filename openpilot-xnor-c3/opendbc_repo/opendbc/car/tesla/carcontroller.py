@@ -292,9 +292,8 @@ class CarController(CarControllerBase):
       return
 
     if not self._cached_autopilot_disabled:
-      return
-
-    if not self._cached_adjust_acc_with_speed_limit:
+      if (self.frame % 200) == 0:
+        cloudlog.info("[XNOR_CRUISE_ENGAGE] gated: autopilot_disabled param is false")
       return
 
     if bool(getattr(CS, "stock_cruise_enabled", False)):
@@ -302,10 +301,14 @@ class CarController(CarControllerBase):
 
     ego_for_engage_ms = self._auto_engage_speed_ms(CS)
     if ego_for_engage_ms < (18.0 * CV.MPH_TO_MS):
+      if (self.frame % 200) == 0:
+        cloudlog.info(f"[XNOR_CRUISE_ENGAGE] gated: speed {ego_for_engage_ms*CV.MS_TO_MPH:.1f}mph < 18mph")
       return
 
     if bool(getattr(CS, "stock_cruise_faulted", False)):
       self._auto_engage_cooldown_until = int(self.frame) + 200  # 2s cooloff
+      if (self.frame % 100) == 0:
+        cloudlog.info("[XNOR_CRUISE_ENGAGE] gated: stock cruise fault")
       return
 
     if int(self.frame) < int(self._auto_engage_cooldown_until):
@@ -335,7 +338,7 @@ class CarController(CarControllerBase):
     self._auto_engage_last_frame = int(self.frame)
     self._auto_engage_attempt += 1
     cloudlog.info(
-      f"[XNOR_CRUISE_SYNC] auto-engage queued {stage} delay={delay} bus={tx_bus} "
+      f"[XNOR_CRUISE_ENGAGE] queued {stage} delay={delay} bus={tx_bus} "
       f"standby={stock_available} ego={ego_for_engage_ms*CV.MS_TO_MPH:.1f}mph"
     )
 
@@ -346,6 +349,8 @@ class CarController(CarControllerBase):
       return
 
     if not self._cached_autopilot_disabled:
+      if (self.frame % 200) == 0:
+        cloudlog.info("[XNOR_CRUISE_ENGAGE] gated: autopilot_disabled param is false")
       return
 
     if not self._cached_adjust_acc_with_speed_limit:
