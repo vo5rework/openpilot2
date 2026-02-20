@@ -50,6 +50,7 @@ class CarController(CarControllerBase):
     self._sm = None
     self._stw_release_frame = -1
     self._auto_engage_last_frame = -100000
+    self._auto_engage_phase = "idle"
 
     # Vehicle model used for lateral limiting
     self.VM = VehicleModel(get_safety_CP())
@@ -122,10 +123,18 @@ class CarController(CarControllerBase):
     return True
 
   def _auto_engage_stock_cruise(self, CC, CS, can_sends) -> None:
-    op_lateral_active = bool(getattr(CC, 'enabled', False) or getattr(CC, 'latActive', False) or getattr(CS, 'cruiseEnabled', False))
-    if not op_lateral_active or (not self._cached_autopilot_disabled):
+    # xnor adaptation of Unity behavior:
+    # below 18mph we run virtual OP cruise only; above 18mph, latch stock cruise (MAIN->RESUME).
+    if not self._cached_autopilot_disabled:
+      self._auto_engage_phase = "idle"
       return
+
+    if not bool(getattr(CS, 'cruiseEnabled', False)):
+      self._auto_engage_phase = "idle"
+      return
+
     if bool(getattr(CS, 'stock_cruise_enabled', False)):
+      self._auto_engage_phase = "latched"
       return
 
     ego_for_engage_ms = max(
@@ -134,16 +143,20 @@ class CarController(CarControllerBase):
       float(getattr(getattr(CS, 'out', None), 'vEgoCluster', 0.0) or 0.0),
     )
     if ego_for_engage_ms < (18.0 * CV.MPH_TO_MS):
+      self._auto_engage_phase = "below_min"
+      return
+
+    if int(self._stw_release_frame) >= int(self.frame):
       return
 
     if (self.frame - int(self._auto_engage_last_frame)) < 100:
       return
 
     stock_available = bool(getattr(CS, 'stock_cruise_available', False))
-    # Unity-aligned adaptation for xnor: once DI reports STANDBY, send RESUME to latch ENABLED.
     btn = CruiseButtons.RES_ACCEL if stock_available else CruiseButtons.MAIN
     if self._queue_stalk_pulse(CS, can_sends, int(btn)):
       self._auto_engage_last_frame = int(self.frame)
+      self._auto_engage_phase = 'resume' if stock_available else 'main'
       stage = 'RESUME' if stock_available else 'MAIN'
       cloudlog.info(f"[XNOR_CRUISE_ENGAGE] queued {stage} ego={ego_for_engage_ms*CV.MS_TO_MPH:.1f}mph standby={stock_available}")
 
