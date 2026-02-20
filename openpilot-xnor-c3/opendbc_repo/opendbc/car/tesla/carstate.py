@@ -75,6 +75,8 @@ class CarState(CarStateBase):
     self.speed_limit_ms = 0.0
     self.speed_limit_ms_das = 0.0
     self.stock_cruise_enabled = False
+    self.stock_cruise_available = False
+    self.stock_cruise_faulted = False
     self.stock_cruise_set_speed_ms = 0.0
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
@@ -141,7 +143,7 @@ class CarState(CarStateBase):
 
 
 
-  def _pick_stock_cruise_set_u(self, di_state: dict, v_ego_ms: float, cruise_enabled: bool, speed_units: str) -> tuple[float, str]:
+  def _pick_stock_cruise_set_u(self, di_state: dict, v_ego_ms: float, cruise_enabled: bool, speed_units: str, cruise_state: str | None = None) -> tuple[float, str]:
     """Pick Tesla cruise setpoint in MPH/KPH without changing the DBC.
 
     - If stock cruise is disabled (XNOR lateral-only), DI_cruiseSet may look like ~0.5*vEgo.
@@ -163,8 +165,12 @@ class CarState(CarStateBase):
     v_u = float(v_ego_ms) * ms_to_u
     thr = max(2.5, 0.10 * max(v_u, 1.0))
 
+    # Treat STANDBY the same as ENABLED for cruise-set decoding/learning.
+    # In xnor traces DI_cruiseSet can remain half-scale while in STANDBY.
+    cruise_available = bool(cruise_state == "STANDBY" or cruise_enabled)
+
     prev_enabled = bool(getattr(self, "_stock_cruise_enabled_prev", False))
-    if bool(cruise_enabled) and (not prev_enabled) and a > 0.0:
+    if cruise_available and (not prev_enabled) and a > 0.0:
       # On enable edge, setpoint typically equals current speed; detect half-scale once.
       if (b > 0.0) and (abs((2.0 * a) - b) <= thr) and (abs(a - b) > thr):
         self._cruise_set_scale = 2.0
@@ -175,10 +181,17 @@ class CarState(CarStateBase):
       elif abs(a - v_u) <= thr:
         self._cruise_set_scale = 1.0
 
-    scale = float(getattr(self, "_cruise_set_scale", 1.0) or 1.0)
-    self._stock_cruise_enabled_prev = bool(cruise_enabled)
+    # Keep learning while in STANDBY/ENABLED to catch forks where DI_cruiseSet stays half-scale.
+    if cruise_available and a > 0.0:
+      if (b > 0.0) and (abs((2.0 * a) - b) <= thr) and (abs(a - b) > thr):
+        self._cruise_set_scale = 2.0
+      elif (abs((2.0 * a) - v_u) <= thr) and (abs(a - v_u) > thr):
+        self._cruise_set_scale = 2.0
 
-    if bool(cruise_enabled):
+    scale = float(getattr(self, "_cruise_set_scale", 1.0) or 1.0)
+    self._stock_cruise_enabled_prev = cruise_available
+
+    if cruise_available:
       if a > 0.0:
         val = a * scale
         src = "DI_cruiseSet" if scale < 1.5 else "DI_cruiseSet_x2"
@@ -201,6 +214,18 @@ class CarState(CarStateBase):
 
     return 0.0, "none"
 
+
+
+  @staticmethod
+  def _decode_map_speed_limit_u(code: int) -> float:
+    # UI_mapSpeedLimit enum fallback (units in mph/kph depending on UI_mapSpeedLimitUnits)
+    table = {
+      1: 5, 2: 7, 3: 10, 4: 15, 5: 20, 6: 25, 7: 30, 8: 35, 9: 40,
+      10: 45, 11: 50, 12: 55, 13: 60, 14: 65, 15: 70, 16: 75, 17: 80,
+      18: 85, 19: 90, 20: 95, 21: 100, 22: 105, 23: 110, 24: 115, 25: 120,
+      26: 130, 27: 140, 28: 150, 29: 160,
+    }
+    return float(table.get(int(code), 0.0))
 
   def _update_speed_limit(self, can_parsers) -> None:
     """Unity-parity speed limit parsing (map/sign + DAS fallback) into m/s."""
@@ -237,7 +262,13 @@ class CarState(CarStateBase):
         if base_map > 0.0 and (speed_limit_type != 0x1F or base_map >= 5.56):
           speed_limit_ms = base_map
         else:
-          speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0) * map_uom_to_ms
+          mpp_u = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0)
+          if mpp_u > 0.0:
+            speed_limit_ms = mpp_u * map_uom_to_ms
+          else:
+            enum_u = self._decode_map_speed_limit_u(int(map_data.get("UI_mapSpeedLimit", 0) or 0))
+            if enum_u > 0.0:
+              speed_limit_ms = enum_u * map_uom_to_ms
     except Exception:
       pass
 
@@ -327,8 +358,10 @@ class CarState(CarStateBase):
     self.update_autopark_state(autopark_state, cruise_enabled)
     # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
-    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_party.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
+    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_party.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom, cruise_state)
     self.stock_cruise_enabled = bool(cruise_enabled)
+    self.stock_cruise_available = bool(cruise_state == "STANDBY" or cruise_enabled)
+    self.stock_cruise_faulted = bool(cruise_state == "FAULT")
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
@@ -540,8 +573,10 @@ class CarState(CarStateBase):
     # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
     ret.cruiseState.enabled = cruise_enabled
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
-    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_chassis.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
+    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_chassis.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom, cruise_state)
     self.stock_cruise_enabled = bool(cruise_enabled)
+    self.stock_cruise_available = bool(cruise_state == "STANDBY" or cruise_enabled)
+    self.stock_cruise_faulted = bool(cruise_state == "FAULT")
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
