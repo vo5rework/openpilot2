@@ -276,6 +276,15 @@ class CarController(CarControllerBase):
     idx = int(self._auto_engage_attempt) % max(1, len(candidates))
     return int(candidates[idx])
 
+  @staticmethod
+  def _auto_engage_speed_ms(CS) -> float:
+    vals = [
+      float(getattr(getattr(CS, "out", None), "vEgo", 0.0) or 0.0),
+      float(getattr(getattr(CS, "out", None), "vEgoRaw", 0.0) or 0.0),
+      float(getattr(getattr(CS, "out", None), "vEgoCluster", 0.0) or 0.0),
+    ]
+    return max(vals)
+
   def _auto_engage_stock_cruise(self, CC, CS) -> None:
     # xnor behavior target: while lateral is active and speed >= 18mph,
     # keep trying to bring stock Tesla cruise up so speed-limit sync can take over.
@@ -291,7 +300,8 @@ class CarController(CarControllerBase):
     if bool(getattr(CS, "stock_cruise_enabled", False)):
       return
 
-    if float(getattr(CS.out, "vEgo", 0.0) or 0.0) < (18.0 * CV.MPH_TO_MS):
+    ego_for_engage_ms = self._auto_engage_speed_ms(CS)
+    if ego_for_engage_ms < (18.0 * CV.MPH_TO_MS):
       return
 
     if bool(getattr(CS, "stock_cruise_faulted", False)):
@@ -314,9 +324,6 @@ class CarController(CarControllerBase):
       delay = 6
 
     stock_available = bool(getattr(CS, "stock_cruise_available", False))
-    if not stock_available:
-      return
-
     tx_bus = int(self._auto_engage_bus(CS))
     # In xnor, SET-only while standby has been unreliable; use MAIN then SET pulse.
     self._stw_sequence = [
@@ -327,7 +334,10 @@ class CarController(CarControllerBase):
 
     self._auto_engage_last_frame = int(self.frame)
     self._auto_engage_attempt += 1
-    cloudlog.info(f"[XNOR_CRUISE_SYNC] auto-engage queued {stage} delay={delay} bus={tx_bus} standby={stock_available}")
+    cloudlog.info(
+      f"[XNOR_CRUISE_SYNC] auto-engage queued {stage} delay={delay} bus={tx_bus} "
+      f"standby={stock_available} ego={ego_for_engage_ms*CV.MS_TO_MPH:.1f}mph"
+    )
 
   def _speed_limit_sync(self, CC, CS, can_sends) -> None:
     # Only when OP is engaged (steering control) and user enabled this feature.
