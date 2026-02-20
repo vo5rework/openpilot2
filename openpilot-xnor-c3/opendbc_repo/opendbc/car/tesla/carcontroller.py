@@ -288,7 +288,10 @@ class CarController(CarControllerBase):
   def _auto_engage_stock_cruise(self, CC, CS) -> None:
     # xnor behavior target: while lateral is active and speed >= 18mph,
     # keep trying to bring stock Tesla cruise up so speed-limit sync can take over.
-    if not bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False)):
+    op_lateral_active = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False) or getattr(CS, "cruiseEnabled", False))
+    if not op_lateral_active:
+      if (self.frame % 200) == 0:
+        cloudlog.info("[XNOR_CRUISE_ENGAGE] gated: lateral not active")
       return
 
     if not self._cached_autopilot_disabled:
