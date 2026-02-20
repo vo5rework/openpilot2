@@ -71,6 +71,7 @@ class CarController(CarControllerBase):
 
     self._speed_sync_last_frame = -100000
     self._auto_engage_last_frame = -100000
+    self._auto_engage_attempt = 0
 
     self._stw_seed = None
     self._stw_seed_bus = int(CANBUS.party)
@@ -180,21 +181,6 @@ class CarController(CarControllerBase):
     except Exception:
       return int(CANBUS.party)
 
-  def _stw_target_buses(self, primary_bus: int) -> tuple[int, ...]:
-    buses = [int(primary_bus)]
-
-    # xnor/AP split buses: mirror virtual stalk commands so MAIN/SET reaches stock cruise path.
-    if self.CP.carFingerprint in LEGACY_CARS:
-      for b in (int(CANBUS.party), int(CANBUS.powertrain)):
-        if b not in buses:
-          buses.append(b)
-    else:
-      for b in (int(CANBUS.party), int(CANBUS.autopilot_party)):
-        if b not in buses:
-          buses.append(b)
-
-    return tuple(buses)
-
   def _action_can_for_bus(self, bus: int):
     return (
       self._action_can_by_bus.get(int(bus)) or
@@ -217,8 +203,7 @@ class CarController(CarControllerBase):
     mc = int(self._stw_seed.get("MC_STW_ACTN_RQ", 0) or 0)
     used_counter = (mc + 1) % 16
 
-    for tx_bus in self._stw_target_buses(b):
-      can_sends.append(self._action_can_for_bus(tx_bus).create_action_request(int(tx_bus), self._stw_seed, int(btn)))
+    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), self._stw_seed, int(btn)))
 
     if int(btn) == int(BTN_MAIN):
       self._emit_fake_das_edges(can_sends, stalk_main=True)
@@ -241,6 +226,17 @@ class CarController(CarControllerBase):
     self._stw_release_bus = int(self._stw_seed_bus)
     return True
 
+  def _queue_stalk_pulse_on_bus(self, CS, can_sends, btn: int, bus: int) -> bool:
+    if int(self._stw_release_frame) > int(self.frame):
+      return False
+
+    if not self._send_stw(CS, can_sends, btn, bus=int(bus)):
+      return False
+
+    self._stw_release_frame = int(self.frame) + 1
+    self._stw_release_bus = int(bus)
+    return True
+
   def _process_stalk_actions(self, CS, can_sends) -> None:
     # Release pending pulse
     if int(self._stw_release_frame) == int(self.frame):
@@ -249,10 +245,35 @@ class CarController(CarControllerBase):
 
     # Run queued press sequence (e.g. legacy MAIN+RESUME on engage)
     if (int(self._stw_release_frame) < 0) and self._stw_sequence:
-      due_frame, btn = self._stw_sequence[0]
+      item = self._stw_sequence[0]
+      if len(item) >= 3:
+        due_frame, btn, bus = item
+      else:
+        due_frame, btn = item
+        bus = None
       if int(self.frame) >= int(due_frame):
-        if self._queue_stalk_pulse(CS, can_sends, int(btn)):
+        sent = (
+          self._queue_stalk_pulse(CS, can_sends, int(btn)) if bus is None else
+          self._queue_stalk_pulse_on_bus(CS, can_sends, int(btn), int(bus))
+        )
+        if sent:
           self._stw_sequence.pop(0)
+
+  def _auto_engage_bus(self, CS) -> int:
+    primary = int(self._stw_bus(CS))
+    if self.CP.carFingerprint in LEGACY_CARS:
+      candidates = [primary]
+      for b in (int(CANBUS.party), int(CANBUS.powertrain)):
+        if b not in candidates:
+          candidates.append(b)
+    else:
+      candidates = [primary]
+      for b in (int(CANBUS.party), int(CANBUS.autopilot_party)):
+        if b not in candidates:
+          candidates.append(b)
+
+    idx = int(self._auto_engage_attempt) % max(1, len(candidates))
+    return int(candidates[idx])
 
   def _auto_engage_stock_cruise(self, CC, CS) -> None:
     # xnor behavior target: while lateral is active and speed >= 18mph,
@@ -284,9 +305,14 @@ class CarController(CarControllerBase):
     else:
       delay = 6
 
-    self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + int(delay), BTN_DOWN1)]
+    tx_bus = int(self._auto_engage_bus(CS))
+    self._stw_sequence = [
+      (int(self.frame), BTN_MAIN, tx_bus),
+      (int(self.frame) + int(delay), BTN_DOWN1, tx_bus),
+    ]
     self._auto_engage_last_frame = int(self.frame)
-    cloudlog.info(f"[XNOR_CRUISE_SYNC] auto-engage queued MAIN+SET delay={delay}")
+    self._auto_engage_attempt += 1
+    cloudlog.info(f"[XNOR_CRUISE_SYNC] auto-engage queued MAIN+SET delay={delay} bus={tx_bus}")
 
   def _speed_limit_sync(self, CC, CS, can_sends) -> None:
     # Only when OP is engaged (steering control) and user enabled this feature.
