@@ -215,7 +215,7 @@ class CarController(CarControllerBase):
     self._stw_last_send_frame = int(self.frame)
     return True
 
-  def _queue_stalk_pulse(self, CS, can_sends, btn: int) -> bool:
+  def _queue_stalk_pulse(self, CS, can_sends, btn: int, hold_frames: int = 1) -> bool:
     # Unity-like pulse: press now, release next frame.
     if int(self._stw_release_frame) > int(self.frame):
       return False
@@ -223,18 +223,18 @@ class CarController(CarControllerBase):
     if not self._send_stw(CS, can_sends, btn):
       return False
 
-    self._stw_release_frame = int(self.frame) + 1
+    self._stw_release_frame = int(self.frame) + max(1, int(hold_frames))
     self._stw_release_bus = int(self._stw_seed_bus)
     return True
 
-  def _queue_stalk_pulse_on_bus(self, CS, can_sends, btn: int, bus: int) -> bool:
+  def _queue_stalk_pulse_on_bus(self, CS, can_sends, btn: int, bus: int, hold_frames: int = 1) -> bool:
     if int(self._stw_release_frame) > int(self.frame):
       return False
 
     if not self._send_stw(CS, can_sends, btn, bus=int(bus)):
       return False
 
-    self._stw_release_frame = int(self.frame) + 1
+    self._stw_release_frame = int(self.frame) + max(1, int(hold_frames))
     self._stw_release_bus = int(bus)
     return True
 
@@ -247,15 +247,18 @@ class CarController(CarControllerBase):
     # Run queued press sequence (e.g. legacy MAIN+RESUME on engage)
     if (int(self._stw_release_frame) < 0) and self._stw_sequence:
       item = self._stw_sequence[0]
-      if len(item) >= 3:
+      hold = 1
+      if len(item) >= 4:
+        due_frame, btn, bus, hold = item
+      elif len(item) >= 3:
         due_frame, btn, bus = item
       else:
         due_frame, btn = item
         bus = None
       if int(self.frame) >= int(due_frame):
         sent = (
-          self._queue_stalk_pulse(CS, can_sends, int(btn)) if bus is None else
-          self._queue_stalk_pulse_on_bus(CS, can_sends, int(btn), int(bus))
+          self._queue_stalk_pulse(CS, can_sends, int(btn), hold_frames=int(hold)) if bus is None else
+          self._queue_stalk_pulse_on_bus(CS, can_sends, int(btn), int(bus), hold_frames=int(hold))
         )
         if sent:
           self._stw_sequence.pop(0)
@@ -320,10 +323,10 @@ class CarController(CarControllerBase):
 
     stock_available = bool(getattr(CS, "stock_cruise_available", False))
     tx_bus = int(self._auto_engage_bus(CS))
-    # In xnor, SET-only while standby has been unreliable; use MAIN then SET pulse.
+    # Use a slightly longer button hold for engage pulses (closer to physical stalk timing).
     self._stw_sequence = [
-      (int(self.frame), BTN_MAIN, tx_bus),
-      (int(self.frame) + int(delay), BTN_UP1, tx_bus),
+      (int(self.frame), BTN_MAIN, tx_bus, 2),
+      (int(self.frame) + int(delay), BTN_UP1, tx_bus, 2),
     ]
     stage = "MAIN+RESUME"
 
