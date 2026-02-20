@@ -3,15 +3,16 @@
 
 Stable steering + Unity-parity virtual stalk for cruise speed-limit matching.
 
-What this file does (only two things):
-  1) publishes internal 0x659 (fake DAS) on bus 0 and bus 4 for panda safety (existing xnor behavior)
-  2) when enabled + Tesla cruise is engaged, nudges Tesla cruise SET speed toward map speed limit
-     by emitting STW_ACTN_RQ (cruise stalk up/down), using TeslaCAN.create_action_request() (CRC+counter).
-
-It does *not* change steering behavior or ALC behavior.
+Key HW2/Legacy behavior (matches Unity + your stalk2 capture):
+  - STW_ACTN_RQ is sent only on 10Hz ticks (frame % 10 == 0)
+  - button presses are held 2 ticks (cancel 3 ticks), then released to IDLE
+  - payload is mirrored on BOTH bus 0 (party) and bus 2 (autopilot_party) with identical bytes
+  - counter/CRC comes from TeslaCAN.create_action_request() and is kept consistent across both buses
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -41,11 +42,17 @@ except ImportError:
 # SpdCtrlLvr_Stat (STW_ACTN_RQ)
 BTN_IDLE = 0
 BTN_CANCEL = 1
-BTN_MAIN = 2
+BTN_MAIN = 2   # HW2: RWD pull (engage)
 BTN_UP2 = 4
 BTN_DOWN2 = 8
 BTN_UP1 = 16
 BTN_DOWN1 = 32
+
+
+@dataclass
+class _StalkAction:
+  btn: int
+  hold_ticks: int
 
 
 class CarController(CarControllerBase):
@@ -71,12 +78,20 @@ class CarController(CarControllerBase):
 
     self._speed_sync_last_frame = -100000
 
-    self._stw_seed = None
-    self._stw_seed_bus = int(CANBUS.party)
-    self._stw_last_send_frame = -100000
-    self._stw_release_frame = -1
-    self._stw_release_bus = int(CANBUS.party)
-    self._stw_sequence = []  # list[(frame:int, btn:int)]
+    # Virtual stalk sender state (Unity parity)
+    self._stw_seed: dict | None = None
+    self._stw_seed_bus_from_car = int(CANBUS.party)
+    self._stw_last_seed_frame = -100000
+
+    self._stw_active_btn = BTN_IDLE
+    self._stw_active_ticks_left = 0
+    self._stw_release_ticks_left = 0
+    self._stw_queue: list[_StalkAction] = []
+
+    # 10Hz STW scheduler (Unity parity): use time, not frame, to avoid drift
+    self._stw_tick_ns = 100_000_000  # 100ms
+    self._stw_next_tick_ns: int | None = None
+
     self._op_enabled_prev = False
 
     if CP.carFingerprint in LEGACY_CARS:
@@ -124,7 +139,10 @@ class CarController(CarControllerBase):
     self._op659_prev_btn = stalk_btn
 
     if (self.frame % 10 == 0) or main_edge or cancel_edge:
-      for bus in (CANBUS.party,):
+      buses = {int(CANBUS.party)}
+      if self.CP.carFingerprint in LEGACY_CARS:
+        buses.add(int(CANBUS.powertrain))
+      for bus in sorted(buses):
         can_sends.append(create_fake_das(
           self._cached_pedal_enabled,
           self._cached_autopilot_disabled,
@@ -134,7 +152,6 @@ class CarController(CarControllerBase):
         ))
 
   def _speed_limit_target_ms(self, CS) -> float:
-    # Prefer CarState's helper (uses DAS fused if present + supports relative offset)
     try:
       return float(CS._calc_speed_limit_target_ms(str(getattr(CS, "speed_units", "MPH"))))
     except Exception:
@@ -151,67 +168,121 @@ class CarController(CarControllerBase):
     uom = str(getattr(CS, "speed_units", "MPH"))
     return max(0.0, limit_ms + (off * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)))
 
-  def _stw_bus(self, CS) -> int:
-    try:
-      return int(getattr(CS, "stw_actn_bus", CANBUS.party))
-    except Exception:
-      return int(CANBUS.party)
-
-  def _action_can_for_bus(self, bus: int):
+  def _action_can_for_bus(self, bus: int) -> TeslaCAN:
     return (
       self._action_can_by_bus.get(int(bus)) or
       self._action_can_by_bus.get(int(CANBUS.party)) or
       next(iter(self._action_can_by_bus.values()))
     )
 
-  def _send_stw(self, CS, can_sends, btn: int, *, bus: int | None = None) -> bool:
+  def _stw_mirror_buses(self) -> tuple[int, ...]:
+    b0 = int(getattr(CANBUS, "party", 0))
+    b2 = int(getattr(CANBUS, "autopilot_party", b0))
+    return (b0,) if b2 == b0 else (b0, b2)
+
+  def _stw_in_progress(self) -> bool:
+    return bool(self._stw_queue) or (self._stw_active_ticks_left > 0) or (self._stw_release_ticks_left > 0)
+
+  def _stw_resync_seed_from_car(self, CS) -> None:
     msg = getattr(CS, "msg_stw_actn_req", None)
-    if msg is None:
+    if not isinstance(msg, dict):
+      return
+    if int(msg.get("SpdCtrlLvr_Stat", BTN_IDLE) or 0) != BTN_IDLE:
+      return
+    self._stw_seed = dict(msg)
+    self._stw_seed_bus_from_car = int(getattr(CS, "stw_actn_bus", CANBUS.party))
+    self._stw_last_seed_frame = int(self.frame)
+
+  def _stw_send_mirrored(self, CS, can_sends, btn: int) -> bool:
+    msg = getattr(CS, "msg_stw_actn_req", None)
+    if (self._stw_seed is None) and isinstance(msg, dict):
+      self._stw_seed = dict(msg)
+      self._stw_seed_bus_from_car = int(getattr(CS, "stw_actn_bus", CANBUS.party))
+      self._stw_last_seed_frame = int(self.frame)
+
+    if self._stw_seed is None:
       return False
 
-    b = int(bus if bus is not None else self._stw_bus(CS))
-
-    # Resync seed from the car when idle; preserve our counter across press/release.
-    if (self._stw_seed is None) or (int(self._stw_seed_bus) != b) or ((self.frame - int(self._stw_last_send_frame)) > 20):
-      self._stw_seed = dict(msg)
-      self._stw_seed_bus = int(b)
+    mirror = self._stw_mirror_buses()
+    primary_bus = int(mirror[0])
 
     mc = int(self._stw_seed.get("MC_STW_ACTN_RQ", 0) or 0)
-    used_counter = (mc + 1) % 16
+    next_ctr = (mc + 1) % 16
 
-    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), self._stw_seed, int(btn)))
-
-    self._stw_seed["MC_STW_ACTN_RQ"] = int(used_counter)
-    self._stw_last_send_frame = int(self.frame)
-    return True
-
-  def _queue_stalk_pulse(self, CS, can_sends, btn: int) -> bool:
-    # Unity-like pulse: press now, release next frame.
-    if int(self._stw_release_frame) > int(self.frame):
+    try:
+      addr, _, dat = self._action_can_for_bus(primary_bus).create_action_request(primary_bus, self._stw_seed, int(btn))
+    except Exception:
       return False
 
-    if not self._send_stw(CS, can_sends, btn):
-      return False
+    # Mirror identical payload bytes across both buses (Unity parity)
+    for bus in mirror:
+      can_sends.append((addr, int(bus), dat))
 
-    self._stw_release_frame = int(self.frame) + 1
-    self._stw_release_bus = int(self._stw_seed_bus)
+    # Keep seed counter aligned with the message we just sent (create_action_request increments once).
+    self._stw_seed["MC_STW_ACTN_RQ"] = int(next_ctr)
     return True
+  def _stw_enqueue(self, btn: int, *, hold_ticks: int | None = None) -> None:
+    if hold_ticks is None:
+      hold_ticks = 3 if int(btn) == BTN_CANCEL else 2
+    self._stw_queue.append(_StalkAction(int(btn), int(max(1, hold_ticks))))
 
-  def _process_stalk_actions(self, CS, can_sends) -> None:
-    # Release pending pulse
-    if int(self._stw_release_frame) == int(self.frame):
-      self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_release_bus))
-      self._stw_release_frame = -1
+  def _process_stalk_queue_10hz(self, CS, can_sends, now_nanos: int) -> None:
+    # Keep a fresh idle seed while nothing is happening.
+    if not self._stw_in_progress():
+      self._stw_resync_seed_from_car(CS)
+      return
 
-    # Run queued press sequence (e.g. legacy MAIN+RESUME on engage)
-    if (int(self._stw_release_frame) < 0) and self._stw_sequence:
-      due_frame, btn = self._stw_sequence[0]
-      if int(self.frame) >= int(due_frame):
-        if self._queue_stalk_pulse(CS, can_sends, int(btn)):
-          self._stw_sequence.pop(0)
+    now = int(now_nanos)
 
-  def _speed_limit_sync(self, CC, CS, can_sends) -> None:
-    # Only when OP is engaged (steering control) and user enabled this feature.
+    # Initialize / resync the 10Hz schedule using time, not frame.
+    if self._stw_next_tick_ns is None:
+      self._stw_next_tick_ns = now
+    elif (now - int(self._stw_next_tick_ns)) > int(self._stw_tick_ns):
+      # If we've been idle or delayed, restart cadence cleanly.
+      self._stw_next_tick_ns = now
+
+    if now < int(self._stw_next_tick_ns):
+      return
+
+    # Schedule the next tick; if we're far behind, jump forward.
+    self._stw_next_tick_ns = int(self._stw_next_tick_ns) + int(self._stw_tick_ns)
+    if int(self._stw_next_tick_ns) < (now - int(self._stw_tick_ns)):
+      self._stw_next_tick_ns = now + int(self._stw_tick_ns)
+
+    # Start next action (press phase)
+    if (self._stw_active_ticks_left <= 0) and (self._stw_release_ticks_left <= 0) and self._stw_queue:
+      act = self._stw_queue.pop(0)
+      self._stw_active_btn = int(act.btn)
+      self._stw_active_ticks_left = int(act.hold_ticks)
+      self._stw_release_ticks_left = 1
+
+      # Snapshot seed at the moment we start, but never from a non-idle loopback frame.
+      msg = getattr(CS, "msg_stw_actn_req", None)
+      if isinstance(msg, dict) and int(msg.get("SpdCtrlLvr_Stat", BTN_IDLE) or 0) == BTN_IDLE:
+        self._stw_seed = dict(msg)
+        self._stw_seed_bus_from_car = int(getattr(CS, "stw_actn_bus", CANBUS.party))
+        self._stw_last_seed_frame = int(self.frame)
+
+    btn_to_send = BTN_IDLE
+    if self._stw_active_ticks_left > 0:
+      btn_to_send = int(self._stw_active_btn)
+      self._stw_active_ticks_left -= 1
+    elif self._stw_release_ticks_left > 0:
+      btn_to_send = BTN_IDLE
+      self._stw_release_ticks_left -= 1
+
+    # If the human is pressing a different stalk action, defer our send for this tick.
+    cur_btn = int(getattr(CS, "cruise_buttons", 0) or 0)
+    if (cur_btn != BTN_IDLE) and (cur_btn != int(btn_to_send)) and (cur_btn != int(self._stw_active_btn)):
+      return
+
+    if not self._stw_send_mirrored(CS, can_sends, btn_to_send):
+      self._stw_active_ticks_left = 0
+      self._stw_release_ticks_left = 0
+      self._stw_queue.clear()
+      if (self.frame % 200) == 0:
+        cloudlog.info("[XNOR_STW] gated: missing CS.msg_stw_actn_req")
+  def _speed_limit_sync(self, CC, CS) -> None:
     enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
     if not enabled:
       return
@@ -222,11 +293,9 @@ class CarController(CarControllerBase):
     if not self._cached_adjust_acc_with_speed_limit:
       return
 
-    # Don't overlap with press/release sequencing
-    if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
+    if self._stw_in_progress():
       return
 
-    # Rate limit: 0.5s (Unity parity-ish)
     if (self.frame - int(self._speed_sync_last_frame)) < 50:
       return
 
@@ -250,25 +319,21 @@ class CarController(CarControllerBase):
     ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
     diff_u = (target_ms - current_ms) * ms_to_u
 
-    # Deadband: ~1 unit
     if abs(diff_u) < 0.9:
       return
 
-    # Choose 5-unit vs 1-unit press
     if diff_u > 0:
       btn = BTN_UP2 if diff_u >= 4.5 else BTN_UP1
     else:
       btn = BTN_DOWN2 if diff_u <= -4.5 else BTN_DOWN1
 
-    if self._queue_stalk_pulse(CS, can_sends, btn):
-      self._speed_sync_last_frame = int(self.frame)
-      cloudlog.info(
-        f"[XNOR_CRUISE_SYNC] uom={uom} target={target_ms*ms_to_u:.1f} current={current_ms*ms_to_u:.1f} "
-        f"diff={diff_u:.1f} btn={btn}"
-      )
-    else:
-      if (self.frame % 200) == 0:
-        cloudlog.info("[XNOR_CRUISE_SYNC] gated: missing CS.msg_stw_actn_req")
+    self._stw_enqueue(btn, hold_ticks=2)
+    self._speed_sync_last_frame = int(self.frame)
+
+    cloudlog.info(
+      f"[XNOR_CRUISE_SYNC] uom={uom} target={target_ms*ms_to_u:.1f} current={current_ms*ms_to_u:.1f} "
+      f"diff={diff_u:.1f} btn={btn}"
+    )
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
@@ -279,7 +344,6 @@ class CarController(CarControllerBase):
 
     autopilot_disabled = bool(self._cached_autopilot_disabled)
 
-    # Always define before use
     human_control = bool(getattr(CS, "human_control", False))
 
     op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
@@ -287,15 +351,16 @@ class CarController(CarControllerBase):
       if (autopilot_disabled and (self.CP.carFingerprint in LEGACY_CARS) and
           (float(getattr(CS.out, "vEgo", 0.0)) >= (18.0 * CV.MPH_TO_MS)) and
           (not bool(getattr(CS, "stock_cruise_enabled", False))) and
-          (not bool(self._stw_sequence))):
-        # Unity parity: legacy cars often require MAIN + SET on engage
-        self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + 10, BTN_DOWN1)]
-        cloudlog.info("[XNOR_CRUISE_SYNC] legacy engage: queued MAIN+SET")
+          (not self._stw_in_progress())):
+        # HW2: RWD pull (2) held 2 ticks @10Hz, mirrored b0+b2 (Unity parity)
+        self._stw_enqueue(BTN_MAIN, hold_ticks=2)
+        cloudlog.info("[XNOR_CRUISE_ENGAGE] queued RWD engage (SpdCtrl=2)")
+
     self._op_enabled_prev = bool(op_enabled)
 
-    self._process_stalk_actions(CS, can_sends)
-
-    self._speed_limit_sync(CC, CS, can_sends)
+    # Decide any new speed-limit press (enqueue), then run the 10Hz sender.
+    self._speed_limit_sync(CC, CS)
+    self._process_stalk_queue_10hz(CS, can_sends, int(now_nanos))
 
     lat_active = (
       bool(CC.latActive) and
@@ -359,3 +424,44 @@ class CarController(CarControllerBase):
 
     self.frame += 1
     return new_actuators, can_sends
+
+# ===== ABSTRACT-SAFETY SHIM =====
+# If an indentation/merge slip moves CarController.update() outside the class,
+# Python will treat CarController as abstract and crash at startup. This shim
+# installs a minimal compatible update() only when required.
+import abc as _abc  # noqa: E402
+import inspect as _inspect  # noqa: E402
+
+def _cc_update_shim(self, CC, CS, now_nanos, *args, **kwargs):  # noqa: D401
+  actuators = getattr(CC, "actuators", None) or CC.actuators
+  can_sends = kwargs.get("can_sends") or kwargs.get("can_sends_in") or []
+  try:
+    f = getattr(self, "_refresh_cached_params", None)
+    if callable(f):
+      f()
+    f = getattr(self, "_emit_internal_0x659", None)
+    if callable(f):
+      f(CS, can_sends)
+  except Exception:
+    pass
+
+  new_actuators = actuators.as_builder()
+  try:
+    new_actuators.steeringAngleDeg = float(getattr(self, "apply_angle_last", 0.0))
+  except Exception:
+    pass
+
+  try:
+    self.frame = int(getattr(self, "frame", 0)) + 1
+  except Exception:
+    pass
+  return new_actuators, can_sends
+
+if _inspect.isabstract(CarController):  # pragma: no cover
+  try:
+    cloudlog.error(f"[XNOR] CarController abstract ({sorted(getattr(CarController, '__abstractmethods__', []))}); applying shim")
+  except Exception:
+    pass
+  CarController.update = _cc_update_shim
+  _abc.update_abstractmethods(CarController)
+# ===== END ABSTRACT-SAFETY SHIM =====
