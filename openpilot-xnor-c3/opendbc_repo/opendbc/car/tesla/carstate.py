@@ -75,6 +75,8 @@ class CarState(CarStateBase):
     self.speed_limit_ms = 0.0
     self.speed_limit_ms_das = 0.0
     self.stock_cruise_enabled = False
+    self.stock_cruise_available = False
+    self.stock_cruise_faulted = False
     self.stock_cruise_set_speed_ms = 0.0
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
@@ -202,6 +204,18 @@ class CarState(CarStateBase):
     return 0.0, "none"
 
 
+
+  @staticmethod
+  def _decode_map_speed_limit_u(code: int) -> float:
+    # UI_mapSpeedLimit enum fallback (units in mph/kph depending on UI_mapSpeedLimitUnits)
+    table = {
+      1: 5, 2: 7, 3: 10, 4: 15, 5: 20, 6: 25, 7: 30, 8: 35, 9: 40,
+      10: 45, 11: 50, 12: 55, 13: 60, 14: 65, 15: 70, 16: 75, 17: 80,
+      18: 85, 19: 90, 20: 95, 21: 100, 22: 105, 23: 110, 24: 115, 25: 120,
+      26: 130, 27: 140, 28: 150, 29: 160,
+    }
+    return float(table.get(int(code), 0.0))
+
   def _update_speed_limit(self, can_parsers) -> None:
     """Unity-parity speed limit parsing (map/sign + DAS fallback) into m/s."""
     speed_limit_ms = 0.0
@@ -237,7 +251,13 @@ class CarState(CarStateBase):
         if base_map > 0.0 and (speed_limit_type != 0x1F or base_map >= 5.56):
           speed_limit_ms = base_map
         else:
-          speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0) * map_uom_to_ms
+          mpp_u = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0)
+          if mpp_u > 0.0:
+            speed_limit_ms = mpp_u * map_uom_to_ms
+          else:
+            enum_u = self._decode_map_speed_limit_u(int(map_data.get("UI_mapSpeedLimit", 0) or 0))
+            if enum_u > 0.0:
+              speed_limit_ms = enum_u * map_uom_to_ms
     except Exception:
       pass
 
@@ -329,6 +349,8 @@ class CarState(CarStateBase):
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
     cruise_set_u, src = self._pick_stock_cruise_set_u(cp_party.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
+    self.stock_cruise_available = bool(cruise_state == "STANDBY" or cruise_enabled)
+    self.stock_cruise_faulted = bool(cruise_state == "FAULT")
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
@@ -542,6 +564,8 @@ class CarState(CarStateBase):
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
     cruise_set_u, src = self._pick_stock_cruise_set_u(cp_chassis.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
+    self.stock_cruise_available = bool(cruise_state == "STANDBY" or cruise_enabled)
+    self.stock_cruise_faulted = bool(cruise_state == "FAULT")
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
