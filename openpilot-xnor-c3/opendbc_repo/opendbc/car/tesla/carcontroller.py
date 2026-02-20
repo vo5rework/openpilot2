@@ -70,6 +70,7 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0.0
 
     self._speed_sync_last_frame = -100000
+    self._auto_engage_last_frame = -100000
 
     self._stw_seed = None
     self._stw_seed_bus = int(CANBUS.party)
@@ -114,6 +115,28 @@ class CarController(CarControllerBase):
     except Exception:
       self._cached_speed_limit_offset_uom = 0.0
 
+  def _fake_das_buses(self) -> tuple[int, ...]:
+    buses = [int(CANBUS.party)]
+    try:
+      pt = int(CANBUS.powertrain)
+      if pt not in buses:
+        buses.append(pt)
+    except Exception:
+      pass
+    return tuple(buses)
+
+  def _emit_fake_das_edges(self, can_sends, *, stalk_main: bool = False, stalk_cancel: bool = False) -> None:
+    if not stalk_main and not stalk_cancel:
+      return
+    for bus in self._fake_das_buses():
+      can_sends.append(create_fake_das(
+        self._cached_pedal_enabled,
+        self._cached_autopilot_disabled,
+        bus=bus,
+        stalk_main=bool(stalk_main),
+        stalk_cancel=bool(stalk_cancel),
+      ))
+
   def _emit_internal_0x659(self, CS, can_sends) -> None:
     stalk_btn = int(getattr(CS, "cruise_buttons", 0) or 0)
     prev_btn = int(self._op659_prev_btn)
@@ -124,7 +147,7 @@ class CarController(CarControllerBase):
     self._op659_prev_btn = stalk_btn
 
     if (self.frame % 10 == 0) or main_edge or cancel_edge:
-      for bus in (CANBUS.party,):
+      for bus in self._fake_das_buses():
         can_sends.append(create_fake_das(
           self._cached_pedal_enabled,
           self._cached_autopilot_disabled,
@@ -181,6 +204,11 @@ class CarController(CarControllerBase):
 
     can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), self._stw_seed, int(btn)))
 
+    if int(btn) == int(BTN_MAIN):
+      self._emit_fake_das_edges(can_sends, stalk_main=True)
+    elif int(btn) == int(BTN_CANCEL):
+      self._emit_fake_das_edges(can_sends, stalk_cancel=True)
+
     self._stw_seed["MC_STW_ACTN_RQ"] = int(used_counter)
     self._stw_last_send_frame = int(self.frame)
     return True
@@ -209,6 +237,40 @@ class CarController(CarControllerBase):
       if int(self.frame) >= int(due_frame):
         if self._queue_stalk_pulse(CS, can_sends, int(btn)):
           self._stw_sequence.pop(0)
+
+  def _auto_engage_stock_cruise(self, CC, CS) -> None:
+    # xnor behavior target: while lateral is active and speed >= 18mph,
+    # keep trying to bring stock Tesla cruise up so speed-limit sync can take over.
+    if not bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False)):
+      return
+
+    if not self._cached_autopilot_disabled:
+      return
+
+    if not self._cached_adjust_acc_with_speed_limit:
+      return
+
+    if bool(getattr(CS, "stock_cruise_enabled", False)):
+      return
+
+    if float(getattr(CS.out, "vEgo", 0.0) or 0.0) < (18.0 * CV.MPH_TO_MS):
+      return
+
+    if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
+      return
+
+    # Retry once per second until stock cruise is engaged.
+    if (self.frame - int(self._auto_engage_last_frame)) < 100:
+      return
+
+    if self.CP.carFingerprint in LEGACY_CARS:
+      delay = 10
+    else:
+      delay = 6
+
+    self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + int(delay), BTN_DOWN1)]
+    self._auto_engage_last_frame = int(self.frame)
+    cloudlog.info(f"[XNOR_CRUISE_SYNC] auto-engage queued MAIN+SET delay={delay}")
 
   def _speed_limit_sync(self, CC, CS, can_sends) -> None:
     # Only when OP is engaged (steering control) and user enabled this feature.
@@ -283,15 +345,9 @@ class CarController(CarControllerBase):
     human_control = bool(getattr(CS, "human_control", False))
 
     op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
-    if op_enabled and (not bool(self._op_enabled_prev)):
-      if (autopilot_disabled and (self.CP.carFingerprint in LEGACY_CARS) and
-          (float(getattr(CS.out, "vEgo", 0.0)) >= (18.0 * CV.MPH_TO_MS)) and
-          (not bool(getattr(CS, "stock_cruise_enabled", False))) and
-          (not bool(self._stw_sequence))):
-        # Unity parity: legacy cars often require MAIN + SET on engage
-        self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + 10, BTN_DOWN1)]
-        cloudlog.info("[XNOR_CRUISE_SYNC] legacy engage: queued MAIN+SET")
     self._op_enabled_prev = bool(op_enabled)
+
+    self._auto_engage_stock_cruise(CC, CS)
 
     self._process_stalk_actions(CS, can_sends)
 
